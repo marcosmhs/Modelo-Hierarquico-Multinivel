@@ -1,0 +1,654 @@
+---
+title: "HLM"
+author: "Marcos H Silva"
+date: "24/04/2022"
+output: html_document
+---
+
+# Modelo de regressão multinível
+
+### Uma rápida introdução
+
+O texto de hoje é sobre uma outra forma de criar um modelo capaz de "prever" um resultado baseado em dados. Meus últimos dois textos abordaram formas de criar redes neurais e como usá-las para prever resultados: [Rede neural recorrente para identificação de dígitos](https://www.linkedin.com/pulse/rede-neural-recorrente-para-identifica%C3%A7%C3%A3o-de-d%C3%ADgitos-marcos-silva/) e [Rede LSTM para predição da cotação do dólar](https://rpubs.com/marcosmhs/rede_lstm_predicao_dolar).
+
+Hoje trago uma outra abordagem, tão importante quanto as redes neurais e capaz de criar resultados mais claros!
+
+Imagine que você gostaria de avaliar qual seria o resultado de sua empresa usando por exemplo a nota do NPS que suas lojas (ou loja) recebeu. Para lhe ajudar com este cálculo você possui uma base de dados com registros históricos, acumulando as vendas dos últimos 12 meses e das notas que as lojas registraram.
+
+Se colocarmos estes dados em um gráfico do excel com receita no eixo X e NPS no eixo Y, teremos o seguinte resultado:
+
+![](imgs/exemplo_reta_regressao.png)
+
+Cada ponto preto representa o cruzamento de resultado e NPS de uma loja e a linha azul é a reta de regressão, uma linha que tenta passar o mais próximo possível de todos os pontos, numa tentativa de resumir o gráfico a uma só informação.
+
+Um modelo de regressão tenta estimar qual seria a reta para dados que não estão em sua base, usando apenas as informações existentes. **Por exemplo, qual será a receita de uma loja se ela tiver uma nota NPS 87,8?**
+
+A fórmula base para explicar um modelo de regressão linear com base neste exemplo seria:
+
+$$
+Y = \gamma_0 + NPS_1 * \gamma_1 + \epsilon
+$$
+
+Onde :
+
+-   $\gamma_0$(gama 0) representa uma a média da variável resposta
+
+-   $\gamma_1$ (gama 1) representa a participação do NPS na inclinação da reta de regressão
+
+-   $\epsilon$ (epsilon) representa a distância entre o valor real da receita e o valor que foi previsto pelos termos $\gamma_1$, este valor também é chamado de erro ou resíduo
+
+O desafio neste tipo de modelo é encontrar os valores de $\gamma_0$ e $\gamma_1$para que possamos substituí-los em nossa fórmula e encontrar o valor da receita.
+
+### E quando o mundo não é linear? E quase sempre não é!
+
+A modelagem linear cumpre bem o seu papel em determinados cenários, mas em muitos casos ela sozinha não é suficiente para explicar um mundo tão diverso. **E é ai que entra a modelagem multinível**! Um modelo que prevê que o mundo é feito de grupos e que estes grupos exercem influência sobre os dados. Este modelo considera que os dados podem ser agrupados em até três níveis:
+
+![](imgs/visao_grupos.png)
+
+Onde:
+
+-   Grupo 1 (*t*), podemos trabalhar com uma escala de tempo, por exemplo, se houver dados de minha loja segmentados por mês;
+
+-   Grupo 2 (*i*), temos o indivíduo, no nosso exemplo a loja;
+
+-   Grupo 3 (*j*) temos o agrupamento, neste caso a cidade.
+
+Neste cenário podemos avaliar que as lojas podem ter comportamento diferente dependendo da cidade onde estão localizadas e que variáveis específicas destas cidades podem influenciar em seu resultado, além do NPS.
+
+Neste caso trabalharemos com os grupos *i* e *j* apenas, respectivamente os níveis 1 (loja) e 2 (cidade).
+
+### Preparação dos pacotes
+
+```{r message=FALSE, warning=FALSE}
+pacotes = c("plotly","tidyverse","reshape2","knitr","kableExtra","rgl","car", "nlme","lmtest","fastDummies","msm","lmeInfo","jtools", "data.table", "olsrr")
+
+if(sum(as.numeric(!pacotes %in% installed.packages())) != 0){
+  instalador <- pacotes[!pacotes %in% installed.packages()]
+  for(i in 1:length(instalador)) {
+    install.packages(instalador, dependencies = T)
+    break()}
+  sapply(pacotes, require, character = T) 
+} else {
+  sapply(pacotes, require, character = T) 
+}
+```
+
+A função `stderr_nlme`, de autoria dos professores Fávero e Rafael Sousa ajuda a identificar a significância estatística dos dados de cada nível e de certa forma a calcular o quanto do comportamento dos dados é explicado por cada nível.
+
+```{r message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+stderr_nlme <- function(model){
+  if(base::class(model) != "lme"){
+    base::message("Use a lme object model from nlme package")
+    stop()}
+  resume <- base::summary(model)
+  if(base::length(base::names(model$groups))==1){
+    m.type <- "HLM2"
+  } else if(base::length(base::names(model$groups))==2){
+    m.type <- "HLM3"
+  }
+  if(m.type == "HLM2"){
+    vcov_matrix <- model$apVar
+    logs_sd_re <- base::attr(vcov_matrix,"Pars")
+    if(base::length(logs_sd_re)==2){
+      stderr_tau00 <- msm::deltamethod(~exp(x1)^2,logs_sd_re,vcov_matrix)
+      stderr_sigma <- msm::deltamethod(~exp(x2)^2,logs_sd_re,vcov_matrix)
+      results <- base::data.frame(`RE Components`=base::c("Var(v0j)","Var(e)"),
+                                  `Variance Estimatives`= base::c(base::exp(logs_sd_re)[[1]]^2,
+                                                                  base::exp(logs_sd_re[[2]])^2),
+                                  `Std Err.`=base::c(stderr_tau00,
+                                                     stderr_sigma),
+                                  z=base::c(base::exp(logs_sd_re)[[1]]^2/stderr_tau00,
+                                            base::exp(logs_sd_re[[2]])^2/stderr_sigma),
+                                  `p-value`=base::round(stats::pnorm(q=base::c(base::exp(logs_sd_re)[[1]]^2/stderr_tau00,
+                                                                               base::exp(logs_sd_re[[2]])^2/stderr_sigma),
+                                                                     lower.tail=F)*2,3))
+      return(results)
+    }
+    else{
+      stderr_tau00 <- msm::deltamethod(~exp(x1)^2,logs_sd_re,vcov_matrix)
+      stderr_tau01 <- msm::deltamethod(~exp(x2)^2,logs_sd_re,vcov_matrix)
+      stderr_sigma <- msm::deltamethod(~exp(x4)^2,logs_sd_re,vcov_matrix)
+      results <- base::data.frame(Components=base::c("Var(v0j)","Var(v1j)","Var(e)"),
+                                  `Variance Estimatives`= base::c(base::exp(logs_sd_re)[[1]]^2,
+                                                       base::exp(logs_sd_re[[2]])^2,
+                                                       base::exp(logs_sd_re[[4]])^2),
+                                  `Std Err.`=base::c(stderr_tau00,
+                                                  stderr_tau01,
+                                                  stderr_sigma),
+                                  z=base::c(base::exp(logs_sd_re)[[1]]^2/stderr_tau00,
+                                            base::exp(logs_sd_re[[2]])^2/stderr_tau01,
+                                            base::exp(logs_sd_re[[4]])^2/stderr_sigma),
+                                  `p-value`=base::round(stats::pnorm(q=base::c(base::exp(logs_sd_re)[[1]]^2/stderr_tau00,
+                                                                               base::exp(logs_sd_re[[2]])^2/stderr_tau01,
+                                                                               base::exp(logs_sd_re[[4]])^2/stderr_sigma),
+                                                                     lower.tail=F)*2,3))
+      return(results)
+    }
+  }
+  if(m.type == "HLM3"){
+    vcov_matrix <- model$apVar
+    logs_sd_re <-  base::attr(vcov_matrix,"Pars")
+    if(base::length(logs_sd_re) == 3){
+      stderr_tau_r000 <- msm::deltamethod(~exp(x1)^2,logs_sd_re,vcov_matrix)
+      stderr_tau_u000 <- msm::deltamethod(~exp(x2)^2,logs_sd_re,vcov_matrix)
+      stderr_sigma <- msm::deltamethod(~exp(x3)^2,logs_sd_re,vcov_matrix)
+      results <- base::data.frame(Components=base::c("Var(t00k)","Var(v0jk)","Var(e)"),
+                                  Estimatives=base::c(base::exp(logs_sd_re)[[2]]^2,
+                                                      base::exp(logs_sd_re)[[1]]^2,
+                                                      base::exp(logs_sd_re)[[3]]^2),
+                                  Std_Err=base::c(stderr_tau_u000,
+                                                  stderr_tau_r000,
+                                                  stderr_sigma),
+                                  z=base::c(base::exp(logs_sd_re)[[2]]^2/stderr_tau_u000,
+                                            base::exp(logs_sd_re)[[1]]^2/stderr_tau_r000,
+                                            base::exp(logs_sd_re)[[3]]^2/stderr_sigma),
+                                  `p-value`=base::round(stats::pnorm(q=base::c(base::exp(logs_sd_re)[[2]]^2/stderr_tau_u000,
+                                                                               base::exp(logs_sd_re)[[1]]^2/stderr_tau_r000,
+                                                                               base::exp(logs_sd_re)[[3]]^2/stderr_sigma),
+                                                                     lower.tail=F)*2,3))
+      return(results)
+    } 
+    else{
+      stderr_tau_r000 <- msm::deltamethod(~exp(x1)^2,logs_sd_re,vcov_matrix)
+      stderr_tau_r100 <- msm::deltamethod(~exp(x2)^2,logs_sd_re,vcov_matrix)
+      stderr_tau_u000 <- msm::deltamethod(~exp(x4)^2,logs_sd_re,vcov_matrix)
+      stderr_tau_u100 <- msm::deltamethod(~exp(x5)^2,logs_sd_re,vcov_matrix)
+      stderr_sigma <- msm::deltamethod(~exp(x7)^2,logs_sd_re,vcov_matrix)
+      results <- base::data.frame(`RE_Components`=base::c("Var(t00k)","Var(t10k)",
+                                                          "Var(v0jk)","Var(v1jk)",
+                                                          "Var(e)"),
+                                  `Variance Estimatives`=base::c(base::exp(logs_sd_re)[[4]]^2,
+                                                                 base::exp(logs_sd_re)[[5]]^2,
+                                                                 base::exp(logs_sd_re)[[1]]^2,
+                                                                 base::exp(logs_sd_re)[[2]]^2,
+                                                                 base::exp(logs_sd_re)[[7]]^2),
+                                  `Std Err.`=base::c(stderr_tau_u000,
+                                                     stderr_tau_u100,
+                                                     stderr_tau_r000,
+                                                     stderr_tau_r100,
+                                                     stderr_sigma),
+                                  z=base::c(base::exp(logs_sd_re)[[4]]^2/stderr_tau_u000,
+                                            base::exp(logs_sd_re)[[5]]^2/stderr_tau_u100,
+                                            base::exp(logs_sd_re)[[1]]^2/stderr_tau_r000,
+                                            base::exp(logs_sd_re)[[2]]^2/stderr_tau_r100,
+                                            base::exp(logs_sd_re)[[7]]^2/stderr_sigma),
+                                  `p-value`=base::round(stats::pnorm(q=base::c(base::exp(logs_sd_re)[[4]]^2/stderr_tau_u000,
+                                                                               base::exp(logs_sd_re)[[5]]^2/stderr_tau_u100,
+                                                                               base::exp(logs_sd_re)[[1]]^2/stderr_tau_r000,
+                                                                               base::exp(logs_sd_re)[[2]]^2/stderr_tau_r100,
+                                                                               base::exp(logs_sd_re)[[7]]^2/stderr_sigma),
+                                                                     lower.tail=F)*2,3))
+      return(results)
+    }
+  }
+}
+```
+
+### Importação dos dados e análise exploratória
+
+```{r}
+vendas = 
+  fread("dados_vendas_totais_2021.csv", dec =",", sep=";") %>%
+  select(cidade, loja, receita, nps, inflacao) %>%
+  mutate(loja = as.factor(loja), cidade = as.factor(cidade)) 
+```
+
+Para testar o modelo vamos utilizar uma segunda base de dados semelhante à nossa base de treino (vendas) com 195 registros
+
+```{r}
+teste = 
+  fread("dados_para_teste.csv", dec =",", sep=";") %>%
+  select(cidade, loja, receita, nps, inflacao) %>%
+  mutate(loja = as.factor(loja), cidade = as.factor(cidade)) 
+```
+
+A visualização das primeiras 5 linhas das cidades 1 e 2, foi aplicado a função `scale`para evitar que os dados sejam expostos
+
+```{r}
+rbind(
+  vendas %>% 
+    
+    filter(cidade == 1) %>% 
+    filter(row_number() <= 5),
+  vendas %>% 
+    
+    filter(cidade == 2) %>% 
+    filter(row_number() <= 5)) %>%
+  
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", 
+                position = "center", 
+                full_width = F, 
+                font_size = 14)
+```
+
+Ao visualizarmos a função de densidade de probabilidade da função dependente (receita) observa-se distribuições diferentes dependendo da cidade, mostrando que temos uma dispersão grande dependendo da cidade.
+
+```{r}
+vendas %>% 
+  group_by(cidade) %>% 
+  mutate(linhas = 1:n()) %>% 
+  mutate(x = unlist(density(receita, n = max(linhas))["x"]),
+         y = unlist(density(receita, n = max(linhas))["y"])) %>%
+  
+  ggplot() +
+  geom_area(aes(x = x, y = y, group = cidade, fill = cidade), color = "black", alpha = 0.4) +
+  geom_histogram(aes(x = receita, 
+                     y = ..density.., 
+                     fill = cidade), 
+                 color = "black", 
+                 position = 'identity', 
+                 alpha = 0.3) +
+  facet_wrap(~ cidade) +
+  scale_fill_viridis_d() +
+  scale_color_viridis_d() +
+  theme_classic()
+```
+
+Verificando a inflação por cidade vemos que há uma dispersão significativa
+
+```{r}
+vendas %>%
+  ggplot() +
+  geom_bar(aes(x = cidade, y=inflacao, fill = cidade), stat = "identity") +
+  scale_y_continuous() +
+  scale_fill_viridis_d() +
+  theme_minimal()
+```
+
+Temos aqui os indícios necessário para iniciar a exploração de modelos de regressão!
+
+## Criação dos modelos
+
+Para a modelagem multinível utiliza-se a técnica **step-up** onde o modelo é otimizado a cada execução até obter-se sua versão final. Para verificar o modelo vamos utilizar o **BIC (bayesian information criterion)** critério que avalia o quão perto o modelo está dados reais considerando também as variáveis explicativas.
+
+O primeiro modelo a ser criado é o **modelo nulo**, que não considera nenhuma variável preditora, apenas a receita e o agrupamento por cidade. Sua fórmula pode é:
+
+$$
+receita_{ij} = \gamma_{00} + \nu_{0j} + \epsilon_{ij}
+$$
+
+Onde:
+
+-   $\gamma_{00}$ representa a média geral da variável receita
+
+-   $\nu_{0j}$ representa a influência da cidade sobre a receita
+
+-   $\nu_{ij}$ representa a distância entre a receita calculada para aquela observação e o valor real
+
+Observe que todos os dados são subscritos de com i e j onde i representa o dado no nível loja e j no nível cidade.
+
+No R a execução desta fórmula é feita pelo comando `lme` do pacote `nlme`
+
+```{r}
+#fixed é a fórmula base, de regressão linear
+#random é a fórmula de agrupamento dos dados, neste caso cidade
+hlm_nulo = 
+  lme(fixed = receita ~1, 
+      random = ~1 | cidade, 
+      data = vendas,
+      method = "REML")
+
+BIC(hlm_nulo)
+```
+
+O BIC de nosso modelo base é 14212.24, ele será utilizado mais adiante para compararmos o ganho dos próximos modelos. Quando menor ele for, melhor!
+
+```{r}
+stderr_nlme(hlm_nulo)
+```
+
+Outra informação importante vem através do método `stderr_nlme`, nele podemos ver que o p-value de nossa variável receita (v0j) é estatisticamente significativa (menor que 0,05), indicando que o modelo multinível é aplicável à este caso. Se ela fosse superior a 0,05 o modelo de regressão linear simples seria o mais indicado.
+
+Utilizaremos agora a base de testes para executar nosso modelo e comparar se os resultados previstos estão próximos do resultado real.
+
+```{r}
+teste$hlm_nulo_fitted = predict(hlm_nulo, teste)
+
+teste %>%
+  
+  ggplot() +
+  geom_smooth(aes(x = receita, y = hlm_nulo_fitted),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  geom_smooth(aes(x = receita, y = receita), method = "lm", 
+              color = "gray44", size = 1.05,
+              linetype = "longdash") +
+  labs(x = "Receita real", y = "Valores Preditos") +
+  theme_bw()
+```
+
+Observe que a linha azul (modelo nulo) chega a tocar a linha pontilhada (resultado perfeito), mas apresenta considerável diferença no início e no final da reta.
+
+### **Modelo com interceptos aleatórios**
+
+O próximo passo, é a **modelo com interceptos aleatórios** que considera apenas efeito que a cidade (intercepto) exerce sobre a receita :
+
+$$
+receita_{ij} = \gamma_{00} + \gamma_{10} * nps_{ij} + \nu_{0j} + \epsilon_{ij}
+$$
+
+Onde:
+
+-   $\gamma_{00}$ representa a média geral da variável receita
+
+-   $\gamma_{10}$ representa a inclinação da reta de receita de acordo com o avanço do NPS
+
+-   $\nu_{0j}$ representa a influência da cidade sobre a receita
+
+-   $\nu_{ij}$ representa a distância entre a receita calculada para aquela observação e o valor real
+
+No R a fórmula pode ser representada como no exemplo abaixo:
+
+```{r}
+hlm_intercept_aleatorios = 
+  lme(fixed = receita ~ nps,
+      random = ~1 | cidade,
+      data = vendas,
+      method = "REML")
+
+#observação do BIC do modelo
+BIC(hlm_intercept_aleatorios)
+```
+
+| Modelo                              | BIC        |
+|-------------------------------------|------------|
+| Modelo Nulo                         | 14212.24   |
+| *Modelo com interceptos aleatórios* | *13421,35* |
+
+O indicador BIC, que no modelo nulo, é de 14212,24 foi reduzido para 13421,35 indicando que a variável NPS possui grande efeito sobre a receita.
+
+```{r}
+stderr_nlme(hlm_intercept_aleatorios)
+```
+
+O *p-value* do nível v0j segue abaixo de 0,05 indicando que o modelo é estatisticamente significativo.
+
+Vamos verificar agora como os modelos se aproximam do valor ideal:
+
+```{r}
+
+teste$hlm_intercept_aleatorios_fitted = predict(hlm_intercept_aleatorios, teste)
+
+
+teste %>%
+  
+  ggplot() +
+  geom_smooth(aes(x = receita, y = hlm_nulo_fitted, color = "Modelo Nulo"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  geom_smooth(aes(x = receita, y= hlm_intercept_aleatorios_fitted, color = "Interceptos Aletaórios"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+
+  geom_smooth(aes(x = receita, y = receita), method = "lm", 
+              color = "gray44", size = 1.05,
+              linetype = "longdash") +
+  scale_color_manual("Modelos:", 
+                     values = c("deepskyblue1", "maroon1")) +
+  labs(x = "Receita Real", y = "Receita Prevista") +
+  theme_bw()
+```
+
+Observe que a linha do modelo com interceptos aleatórios chegou muito perto da reta ideal
+
+### Modelo com interceptos e inclinações aleatórias
+
+O próximo passo é verificarmos o efeito que a cidade exerce sobre o NPS e a receita e pode ser descrita pela função:
+
+$$
+receita_{ij} = \gamma_{00} + \gamma_{10} * nps_{ij} + \nu_{0j} + \nu_{1j} * nps_{ij} + \epsilon_{ij}
+$$
+
+Onde:
+
+-   $\gamma_{00}$ representa a média geral da variável receita
+
+-   $\gamma_{10}$ representa a inclinação da reta de receita de acordo com o avanço do NPS
+
+-   $\nu_{0j}$ representa a influência da cidade sobre a receita
+
+-   $\nu_{ij}$ representa a distância entre a receita calculada para aquela observação e o valor real
+
+Observe que agora temos $\nu_{ij}$ influenciando o valor de NPS: $\nu_{ij} * nps_{ij}$
+
+No R teremos:
+
+```{r}
+hlm_intercept_inclin = 
+  lme(fixed = receita ~ nps  + inflacao, 
+      random = ~ nps  | cidade, 
+      data = vendas,
+      method = "REML")
+
+BIC(hlm_intercept_inclin)
+```
+
+Nesta terceira execução observa-se uma nova queda no indicador BIC, mostrando que o volume de erros diminuiu em comparação com os modelos anteriores
+
+| Modelo                                 | BIC     |
+|----------------------------------------|---------|
+| Modelo Nulo                            | 14212   |
+| Interceptos aleatórios                 | *13421* |
+| *Interceptos e inclinações aleatórias* | *13299* |
+
+```{r}
+stderr_nlme(hlm_intercept_inclin)
+```
+
+O *p-value* do nível v0j (nível loja) e v1j seguem abaixo de 0,05 indicando que o modelo continua estatisticamente significativo.
+
+Por fim vamos comparar a performance dos modelos
+
+```{r}
+teste$hlm_intercept_inclin_fitted = predict(hlm_intercept_inclin, teste)
+
+teste %>%
+  
+  ggplot() +
+  geom_smooth(aes(x = receita, y = hlm_nulo_fitted, color = "Modelo Nulo"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  geom_smooth(aes(x = receita, y= hlm_intercept_aleatorios_fitted, color = "Interceptos Aletaórios"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  
+  geom_smooth(aes(x = receita, y= hlm_intercept_inclin_fitted, color = "Interceptos e Inclinações aleatórias"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +  
+
+  geom_smooth(aes(x = receita, y = receita), method = "lm", 
+              color = "gray44", size = 1.05,
+              linetype = "longdash") +
+  scale_color_manual("Modelos:", 
+                     values = c("deepskyblue1", "maroon1", "darkorchid2")) +
+  labs(x = "Receita Real", y = "Receita Prevista") +
+  theme_bw()
+```
+
+### Modelo Final
+
+Agora que verificamos que o NPS tem efeito sobre a receita e que o agrupamento por cidade também exerce efeito sobre as demais informações, vamos verificar se as variáveis do nível de cidade, neste caso a inflação local também impacta no resultado. Teremos finalmente a fórmula completa:
+
+$$
+receita_{ij} = \gamma_{00} + \gamma_{10} * nps_{ij}  + \gamma_{01} * inflacao_{j} + \gamma_{11} * nps_{ij} * inflacao_j + \nu_{0j} + \nu_{1j} * nps_{ij} + \epsilon_{ij}
+$$
+
+No R teremos:
+
+```{r}
+hlm_final = 
+  lme(fixed = receita ~ nps  + inflacao + nps:inflacao,
+      random = ~ nps | cidade,
+      data = vendas,
+      method = "REML")
+
+BIC(hlm_final)
+```
+
+Observamos uma nova redução no BIC, indicando que o houve melhora no modelo ao incluir o efeito da inflação na receita e no NPS.
+
+| Modelo                               | BIC     |
+|--------------------------------------|---------|
+| Modelo Nulo                          | 14212   |
+| Interceptos aletórios                | *13421* |
+| Interceptos e inclinações aleatórias | 13299   |
+| *Modelo Final*                       | *13281* |
+
+```{r}
+stderr_nlme(hlm_final)
+```
+
+O *p-value* do nível v0j (nível loja) e v1j seguem abaixo de 0,05 ou seja, modelo significativo estatisticamente. Vamos verificar visualmente como essa nota reta se porta com a base de testes
+
+```{r}
+teste$hlm_final_fitted = predict(hlm_final, teste)
+
+teste %>%
+  
+  ggplot() +
+  geom_smooth(aes(x = receita, y = hlm_nulo_fitted, color = "1 - Modelo Nulo"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  geom_smooth(aes(x = receita, y= hlm_intercept_aleatorios_fitted, color = "2 - Interceptos Aletaórios"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  
+  geom_smooth(aes(x = receita, y= hlm_intercept_inclin_fitted, color = "3 - Interceptos e Inclinações aleatórias"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +  
+  
+  geom_smooth(aes(x = receita, y= hlm_final_fitted, color = "4 - Modelo Final"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +  
+
+  geom_smooth(aes(x = receita, y = receita), method = "lm", 
+              color = "gray44", size = 1.05,
+              linetype = "longdash") +
+  scale_color_manual("Modelos:", 
+                     values = c("deepskyblue1", "maroon1", "darkorchid2", "SpringGreen3")) +
+  labs(x = "Receita Real", y = "Receita Prevista") +
+  theme_bw()
+```
+
+Ao compararmos as retas de regressão observamos que o modelo final (verde) performa melhor em comparação com todos os demais, ao considerar o efeito de todas as variáveis disponíveis.
+
+### Bônus
+
+Vamos comparar o modelo HLM com um modelo re regressão linar, utilizando todas as técnicas necessárias para aumentar sua acuracidade:
+
+Sabendo que temos uma variável qualitativa (a cidade) utilizaremos o método `dummy_cols` para transformar as colunas de forma que possam ser utilizadas em uma regressão linar. A "dumização" transformará a coluna cidade em uma série de colunas (uma para cada cidade) preenchendo seu valor com 0 ou 1 dependendo do valor da coluna original
+
+```{r}
+vendas_dummies =
+    dummy_cols(.data = vendas,
+               select_columns = "cidade",
+               remove_first_dummy = TRUE,
+               remove_selected_columns = TRUE)
+
+#16 colunas cidade foram criadas, o método dummy_cols não inclui a primeira coluna "dumizada" já que ela é a auzência de dados em todas as demais 16
+```
+
+Executamos o método `lm`para que seja criado o modelo de regressão simples, observe que agora cada coluna cidade deve ser informado na fórmula que seria:
+
+$$
+Y = \gamma_0 + NPS_1 * \gamma_1 + inflacao * \gamma_2 + cidade_1 * \gamma_3 * cidade_2 * \gamma_4 + ... + cidade_n * \gamma_n + \epsilon
+$$
+
+No R teremos a fórmula:
+
+```{r}
+ols_final_dummies =
+  lm(formula = receita ~ nps + inflacao + cidade_2 + cidade_3 + cidade_4 + cidade_5 + cidade_6 + cidade_7 + cidade_8 + cidade_9 + cidade_10 + cidade_11 + cidade_12 +  cidade_13+ cidade_14+ cidade_15+ cidade_16+ cidade_17,
+     data = vendas_dummies)
+```
+
+Ao criar variáveis *dummies* é necessário verificar se uma ou mais desta variáveis possuem significância estatística, para isso usamos o comando `summary`para verificar o *p-value* de cada um, toda variável com p-value maior que 0,05 deve ser removida do modelo
+
+```{r}
+summary(ols_final_dummies)
+```
+
+Para fazer a remoção destas variáveis podemos utilizar o método *stepwise*, que fará a remoção e recalculará o modelo apenas com aquelas variáveis que possuem a capacidade de explicar o modelo
+
+```{r}
+ols_final_dummies_step = 
+  step(object = ols_final_dummies,
+       step = qchisq(p = 0.05, df = 1,lower.tail = FALSE))
+
+BIC(ols_final_dummies_step)
+```
+
+| Modelo                                     | BIC     |
+|--------------------------------------------|---------|
+| Modelo Nulo                                | 14212   |
+| Interceptos aleatórios                     | 13421   |
+| Interceptos e inclinações aleatórias       | 13299   |
+| *Modelo Final*                             | *13281* |
+| OLS com apenas c/ variáveis significativas | 13443   |
+
+Para finalizar vamos comparar o modelo final com o modelo OLS com variáveis *dummies* e *stepwise*:
+
+```{r}
+teste_dummies =
+    dummy_cols(.data = teste,
+               select_columns = "cidade",
+               remove_first_dummy = TRUE,
+               remove_selected_columns = TRUE)
+
+teste_dummies$cidade_2 = NULL
+teste_dummies$cidade_7 = NULL
+teste_dummies$cidade_12 = NULL
+teste_dummies$cidade_17 = NULL
+
+teste$ols_completo_fitted = predict(ols_final_dummies_step, teste_dummies)
+
+
+
+teste %>%
+  
+  ggplot() +
+  geom_smooth(aes(x = receita, y = hlm_final_fitted, color = "1 - HLM Modelo Final"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  geom_smooth(aes(x = receita, y= ols_completo_fitted, color = "2 - OLS c/ Dummies e Stepwise"),
+              method = "lm", se = F, formula = y ~ splines::bs(x, df = 5),
+              size = 1.5) +
+  
+
+  geom_smooth(aes(x = receita, y = receita), method = "lm", 
+              color = "gray44", size = 1.05,
+              linetype = "longdash") +
+  scale_color_manual("Modelos:", 
+                     values = c("deepskyblue1", "maroon1")) +
+  labs(x = "Receita Real", y = "Receita Prevista") +
+  theme_bw()
+```
+
+### Conclusão
+
+A regressão multinível é capaz de considerar melhor todas os aspectos dos dados de treino do modelo, criando um modelo capaz de prever com maior exatidão valores futuros.
+
+Uma outra forma de verificar a qualidade do modelo é através da verificação da raiz quadrada do erro médio (RMSE em inglês), uma métrica utilizada para comparar modelos indicando sua acuracidade (quando menor seu valor melhor o resultado) e reforça a capacidade do modelo multinível em prever resultados com menor erro, neste caso ele é **5x mais eficiente que o modelo tradicional.**
+
+```{r}
+teste %>% 
+  
+  summarise(hlm = sqrt(mean((receita - hlm_final_fitted) ^ 2,na.rm = T)),
+            ols = sqrt(mean((receita - ols_completo_fitted) ^ 2,na.rm = T))) %>%
+  melt() %>%
+  ggplot(aes(y = value, x=variable, fill = factor(variable))) +
+  geom_bar(stat = "identity") + 
+  geom_label(aes(label = (round(value,3))), hjust = 1.2, color = "white", size = 5) +
+  coord_flip() +
+  labs(title="RMSE", 
+       x = "modelos",
+       y = "") + 
+  theme_minimal()
+```
+
+Infelizmente desta vez eu não posso divulgar os dados originais, mas com este mesmo código, apenas substituindo as variáveis receita, NPS, inflação e cidade é possível aplicá-la a diversos cenários de dados.
+
+Caso encontre alguma falha nos algoritmos ou um erro no processo, por favor me avise no meu linkedin (<https://www.linkedin.com/in/marcosmhs/>) e ficarei feliz realizar as correções necessárias e incluí-lo neste texto.
+
+Até a próxima!
